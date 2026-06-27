@@ -8,7 +8,6 @@ backend/.deps/
 backend/vendor/
 tmp/
 frontend/_tmp_*/
-/????????
 /_tmp_*
 
 outputs/diagnosis_tasks/
