@@ -9,6 +9,6 @@ backend/vendor/
 tmp/
 frontend/_tmp_*/
 /_tmp_*
-
+.idea/
 outputs/diagnosis_tasks/
 outputs/chroma_db/
