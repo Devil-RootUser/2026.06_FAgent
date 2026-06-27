@@ -1,0 +1,1 @@
+WaDI operator note: when relation degradation appears near pump and level variables, verify sensor calibration, pump command state, valve feedback and upstream/downstream water level trend in the same window.

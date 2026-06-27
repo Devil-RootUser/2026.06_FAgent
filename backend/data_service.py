@@ -538,3 +538,88 @@ def get_job(job_id: str) -> dict[str, Any]:
         "error": job.error,
         "log_tail": log_tail,
     }
+
+# Phase 2 clean text overrides. Keep the original data loading helpers intact while
+# replacing the user-facing Chinese text that was corrupted in the v1 prototype.
+def root_cause(dataset: str, event_id: int | None = None) -> dict[str, Any]:
+    bundle = load_result_bundle(dataset)
+    columns = bundle["columns"]
+    event = selected_event(dataset, event_id)
+    names = parse_names(event.get("top10_joint"))
+    indices = parse_indices(event.get("top10_joint_indices"))
+    joint_scores = [_safe_float(x) for x in str(event.get("top10_joint_scores", "")).split(";") if x.strip()]
+    node_scores = [_safe_float(x) for x in str(event.get("top10_node_scores", "")).split(";") if x.strip()]
+    edge_scores = [_safe_float(x) for x in str(event.get("top10_edge_scores", "")).split(";") if x.strip()]
+    if not names:
+        node_errors = bundle["node_errors"]
+        mean_errors = node_errors.mean(axis=0)
+        indices = np.argsort(mean_errors)[::-1][:10].astype(int).tolist()
+        names = [columns[i] for i in indices]
+        joint_scores = [_safe_float(mean_errors[i]) for i in indices]
+        node_scores = joint_scores
+        edge_scores = [0.0] * len(indices)
+    max_score = max(joint_scores or [1.0])
+    candidates = []
+    for rank, name in enumerate(names[:10], start=1):
+        raw_score = joint_scores[rank - 1] if rank - 1 < len(joint_scores) else max_score / rank
+        candidates.append(
+            {
+                "rank": rank,
+                "name": name,
+                "index": indices[rank - 1] if rank - 1 < len(indices) else None,
+                "score": _safe_float(raw_score),
+                "normalized": _safe_float(raw_score / (max_score + 1e-9)),
+                "node_score": _safe_float(node_scores[rank - 1] if rank - 1 < len(node_scores) else 0.0),
+                "edge_score": _safe_float(edge_scores[rank - 1] if rank - 1 < len(edge_scores) else 0.0),
+            }
+        )
+    top = candidates[0] if candidates else {"name": "unknown", "score": 0.0}
+    return {
+        "dataset": dataset,
+        "event": event,
+        "candidates": candidates,
+        "evidence": [
+            {"label": "节点预测误差", "value": f"{top['name']} 的重构/预测误差排名最高", "severity": "high"},
+            {"label": "关系退化证据", "value": f"{top['name']} 的相邻关系边出现退化信号", "severity": "high"},
+            {"label": "异常窗口", "value": f"事件 #{event.get('event_id', 1)}", "severity": "medium"},
+            {"label": "建议优先级", "value": f"优先检查 {top['name']} 及其上下游变量", "severity": "medium"},
+        ],
+    }
+
+
+def report(dataset: str, event_id: int | None = None) -> dict[str, Any]:
+    ov = overview(dataset)
+    rc = root_cause(dataset, event_id)
+    graph = relation_graph(dataset, event_id)
+    event = rc["event"]
+    top = rc["candidates"][0] if rc["candidates"] else {"name": "unknown"}
+    edge = graph["top_edges"][0] if graph["top_edges"] else {"source": top["name"], "target": "adjacent", "degradation": 0.0}
+    window = f"{event.get('raw_start_time', event.get('start', '-'))}~{event.get('raw_end_time', event.get('end', '-'))}"
+    return {
+        "event_id": event.get("event_id", 1),
+        "dataset": dataset,
+        "time_window": window,
+        "title": f"{dataset} 异常事件 #{event.get('event_id', 1)} 诊断报告",
+        "sections": [
+            {"title": "异常概况", "body": f"系统在 {window} 窗口内检测到持续异常，峰值异常分数为 {ov['current_score']:.2f}，阈值为 {ov['threshold']:.2f}。"},
+            {"title": "根因候选", "body": f"{top['name']} 排名第一，候选排序由节点预测误差和相邻关系退化证据共同决定。"},
+            {"title": "关系退化", "body": f"Top 退化边为 {edge['source']} -> {edge['target']}，退化强度约 {edge['degradation']:.2f}。该证据用于排查线索，不直接声明严格因果链。"},
+            {"title": "运维建议", "body": f"优先检查 {top['name']} 的读数、执行状态、相邻阀泵和控制链路，并复核该异常窗口的上下游联动关系。"},
+        ],
+    }
+
+
+def agent_answer(dataset: str, question: str, event_id: int | None = None) -> dict[str, Any]:
+    from backend.agent import RuleDiagnosisAgent
+
+    return RuleDiagnosisAgent().execute(dataset, event_id, question)
+
+
+def health() -> dict[str, Any]:
+    datasets = available_datasets()
+    return {
+        "ok": bool(datasets) and RELATION_SCRIPT.exists(),
+        "project_root": str(PROJECT_ROOT),
+        "relation_script": RELATION_SCRIPT.exists(),
+        "datasets": datasets,
+    }

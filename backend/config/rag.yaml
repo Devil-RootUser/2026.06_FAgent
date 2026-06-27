@@ -1,0 +1,15 @@
+vector_store:
+  provider: chroma
+  use_chroma: true
+  persist_directory: outputs/chroma_db
+  collection_name: fagent_knowledge
+splitter:
+  chunk_size: 700
+  chunk_overlap: 90
+embedding:
+  provider: dashscope
+  model: text-embedding-v4
+data_path: data/knowledge
+allowed_file_types: [txt, md, csv, json, pdf]
+top_k: 4
+

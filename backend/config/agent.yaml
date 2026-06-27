@@ -1,0 +1,9 @@
+agent:
+  default_mode: rule
+  llm_provider_env: LLM_PROVIDER
+  llm_model_env: LLM_MODEL
+  llm_api_key_env: LLM_API_KEY
+  llm_base_url_env: LLM_BASE_URL
+diagnosis:
+  stages: [created, detecting, evidence_collecting, retrieving_knowledge, reasoning, reporting, completed]
+

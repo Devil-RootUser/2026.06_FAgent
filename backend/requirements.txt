@@ -1,4 +1,10 @@
-fastapi>=0.111
+﻿fastapi>=0.111
 uvicorn[standard]>=0.30
 numpy>=1.24
 pydantic>=2.7
+
+# Optional phase-2 Agent/RAG enhancements. The app runs without these by using
+# the deterministic rule agent and keyword RAG fallback.
+chromadb>=0.5
+langchain>=0.2
+langchain-openai>=0.1

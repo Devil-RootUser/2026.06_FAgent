@@ -1,21 +1,19 @@
 ﻿from __future__ import annotations
 
 from typing import Literal
-from pathlib import Path
-import sys
 
-DEPS = Path(__file__).resolve().parent / ".deps"
-if DEPS.exists():
-    sys.path.insert(0, str(DEPS))
-
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import data_service as svc
+from . import diagnosis_tasks
+from .model import ModelFactory
+from .rag import get_knowledge_store
 
 
-app = FastAPI(title="Relation-EVGAT Industrial Diagnosis Agent", version="0.1.0")
+app = FastAPI(title="Relation-EVGAT Industrial Diagnosis Agent", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,9 +39,29 @@ class AgentRequest(BaseModel):
     event_id: int | None = None
 
 
+class DiagnosisRequest(BaseModel):
+    dataset: str = "WaDI_A2_ds10"
+    event_id: int | None = 1
+    question: str = "为什么报警？请给出根因和排查建议。"
+    use_llm: bool = False
+
+
+class KnowledgeUploadRequest(BaseModel):
+    filename: str = "note.txt"
+    content: str
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str
+    top_k: int | None = None
+
+
 @app.get("/api/health")
 def health():
-    return svc.health()
+    payload = svc.health()
+    payload["knowledge"] = get_knowledge_store().status
+    payload["agent"] = ModelFactory().status().__dict__
+    return payload
 
 
 @app.get("/api/datasets")
@@ -115,3 +133,83 @@ def report(dataset: str = "WaDI_A2_ds10", event_id: int | None = Query(default=N
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+
+@app.post("/api/diagnosis/tasks")
+def create_diagnosis_task(req: DiagnosisRequest):
+    try:
+        return diagnosis_tasks.create_task(req.dataset, req.event_id, req.question, req.use_llm)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/diagnosis/tasks/{task_id}")
+def get_diagnosis_task(task_id: str):
+    try:
+        return diagnosis_tasks.task_summary(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+
+
+@app.get("/api/diagnosis/tasks/{task_id}/tool-calls")
+def get_diagnosis_tool_calls(task_id: str):
+    try:
+        return diagnosis_tasks.task_tool_calls(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+
+
+@app.get("/api/diagnosis/tasks/{task_id}/thinking/stream")
+def stream_diagnosis_thinking(task_id: str):
+    try:
+        diagnosis_tasks.get_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+    return StreamingResponse(
+        diagnosis_tasks.format_sse(diagnosis_tasks.stream_events(task_id, "thinking")),
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/api/diagnosis/tasks/{task_id}/report/stream")
+def stream_diagnosis_report(task_id: str):
+    try:
+        diagnosis_tasks.get_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+    return StreamingResponse(
+        diagnosis_tasks.format_sse(diagnosis_tasks.stream_events(task_id, "report")),
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/api/knowledge/documents")
+def knowledge_documents():
+    store = get_knowledge_store()
+    return {"documents": store.list_documents(), "status": store.status}
+
+
+@app.post("/api/knowledge/upload")
+async def knowledge_upload(request: Request):
+    store = get_knowledge_store()
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        payload = await request.json()
+        body = KnowledgeUploadRequest(**payload)
+        return store.ingest_text(body.filename, body.content)
+    raw = await request.body()
+    filename = request.headers.get("x-filename", "upload.txt")
+    return store.ingest_text(filename, raw.decode("utf-8", errors="ignore"))
+
+
+@app.post("/api/knowledge/search")
+def knowledge_search(req: KnowledgeSearchRequest):
+    store = get_knowledge_store()
+    return {"query": req.query, "hits": store.search(req.query, req.top_k), "status": store.status}
+
+
+@app.delete("/api/knowledge/documents/{doc_id}")
+def delete_knowledge_document(doc_id: str):
+    deleted = get_knowledge_store().delete_document(doc_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    return {"deleted": True, "doc_id": doc_id}
