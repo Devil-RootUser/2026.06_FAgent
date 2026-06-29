@@ -34,6 +34,7 @@ const TOOL_LABELS: Record<string, string> = {
   generate_report: "诊断报告生成",
   detect_event: "异常检测",
   rank_root_cause: "根因排序",
+  erniebot_reasoning: "大模型推理",
 };
 
 function statusLabel(value?: string) {
@@ -223,7 +224,8 @@ function Diagnosis({ dataset, eventId }: any) {
     </section>
     <section className="panel thinking-panel"><PanelTitle title="Agent 思考流" note="阶段事件与工具执行更新" /><LogList rows={thinking} empty="等待任务流输出..." /></section>
     <section className="panel tool-panel"><PanelTitle title="工具调用日志" note="工业诊断工具" />{calls.length ? calls.map((c: any) => <div className="tool-row" key={c.name}><strong>{toolLabel(c.name)}</strong><span>{statusLabel(c.status)}</span><small>{c.duration_ms || 0} ms</small></div>) : <StateCompact text="任务启动后会显示工具调用。" />}</section>
-    <section className="panel final-panel"><PanelTitle title="报告生成流" note="包含根因与排查建议的最终回答" /><LogList rows={reportStream} empty="报告流尚未生成。" /></section>
+      <section className="panel final-panel"><PanelTitle title="报告生成流" note="包含根因与排查建议的最终回答" /><LogList rows={reportStream} empty="报告流尚未生成。" /></section>
+      <OCRDocPanel dataset={dataset} eventId={eventId} />
   </div>;
 }
 
@@ -254,6 +256,109 @@ function 报告({ dataset, eventId }: any) {
   if (rep.error) return <State text={rep.error} />;
   if (!rep.data) return <State text="正在加载报告..." />;
   return <div className="report-layout"><section className="panel chat-main"><PanelTitle title="诊断问答" note="快捷问题" /><div className="quick">{["为什么报警？", "最可疑变量", "生成报告", "排查步骤"].map((q) => <button key={q} onClick={() => ask(q)}>{q}</button>)}</div><div className="bubble user">这个事件为什么报警？</div><div className="bubble agent"><strong>Agent 诊断</strong><p>{answer || rep.data.sections.map((s: any) => s.body).join(" ")}</p></div><div className="tool-log">{(calls.length ? calls : ["get_event_summary", "rank_root_causes", "inspect_edge_degradation", "generate_report"].map((name) => ({ name, status: "ready" }))).map((c: any) => <span key={c.name}>{toolLabel(c.name)}：{statusLabel(c.status)}</span>)}</div></section><section className="panel report-main"><PanelTitle title="自动生成诊断报告" note={`事件 ID: ${rep.data.event_id}   时间窗口：${rep.data.time_window}`} />{rep.data.sections.map((s: any) => <article className="report-card" key={s.title}><h3>{s.title}</h3><p>{s.body}</p></article>)}<div className="report-actions"><button>导出 PDF</button><button>工具调用日志</button></div></section></div>;
+}
+
+function OCRDocPanel({ dataset, eventId }: any) {
+  const [docText, setDocText] = useState("");
+  const [paragraphsCount, setParagraphsCount] = useState(0);
+  const [industrialInfo, setIndustrialInfo] = useState<any>(null);
+  const [crossAnalysis, setCrossAnalysis] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const [fileName, setFileName] = useState("");
+  const [statusMsg, setStatusMsg] = useState("上传工业文档（Word / PDF，质检报告、工艺卡等），自动提取文字并抽取工艺参数、缺陷描述");
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.name.endsWith(".docx") && !file.name.endsWith(".doc") && !file.name.endsWith(".pdf")) {
+      setStatusMsg("仅支持 .docx、.doc 或 .pdf 文件");
+      return;
+    }
+    setUploading(true);
+    setFileName(file.name);
+    setStatusMsg("文档文字提取中...");
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const base64 = (reader.result as string);
+      try {
+        const res = await postJson("/api/document/extract-info", { file_base64: base64 });
+        setDocText(res.doc_text || "");
+        setParagraphsCount(res.paragraphs_count || 0);
+        setIndustrialInfo(res.industrial_info || {});
+        setCrossAnalysis("");
+        setStatusMsg(`提取完成：${res.doc_text?.length || 0} 字符，已抽取关键信息`);
+      } catch (err) {
+        setStatusMsg("提取失败：" + String(err));
+        setDocText("");
+        setIndustrialInfo(null);
+      } finally {
+        setUploading(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const runCrossModal = async () => {
+    if (!docText) return;
+    setStatusMsg("跨模态关联分析中...");
+    try {
+      const res = await postJson("/api/agent/cross-modal", {
+        dataset,
+        event_id: eventId,
+        doc_text: docText,
+        doc_info: industrialInfo || {},
+      });
+      setCrossAnalysis(res.analysis || "");
+      setStatusMsg("跨模态关联分析完成");
+    } catch (err) {
+      setStatusMsg("跨模态分析失败：" + String(err));
+    }
+  };
+
+  const info = industrialInfo || {};
+  const params = info.process_params || {};
+
+  return <section className="panel ocr-panel">
+    <PanelTitle title="工厂文档智检" note="上传质检报告/工艺卡（Word / PDF） → 文字提取 → ErnieBot 抽取工艺参数、缺陷描述 → 跨模态关联传感器异常（图片 OCR 暂不支持）" />
+    <div className="ocr-upload-row">
+      <label className="upload-btn">{uploading ? "处理中..." : "选择文档"}
+        <input type="file" accept=".docx,.doc,.pdf" onChange={handleFile} disabled={uploading} style={{display:"none"}} />
+      </label>
+      <span className="ocr-status">{statusMsg}</span>
+      {fileName && <span className="file-name-tag">{fileName}</span>}
+    </div>
+
+    {docText && <div className="ocr-result-section">
+      <div className="ocr-section-title">提取的文字内容</div>
+      <pre className="ocr-text">{docText.substring(0, 800)}{docText.length > 800 ? "..." : ""}</pre>
+    </div>}
+
+    {industrialInfo && (Object.keys(params).length > 0 || info.defect_type || info.material) && <div className="ocr-result-section">
+      <div className="ocr-section-title">ErnieBot 抽取的关键工业信息</div>
+      <div className="info-grid">
+        {info.material && <div className="info-item"><span>材料/部件</span><strong>{info.material}</strong></div>}
+        {info.defect_type && <div className="info-item"><span>缺陷类型</span><strong className="defect">{info.defect_type}</strong></div>}
+        {info.defect_location && <div className="info-item"><span>缺陷位置</span><strong>{info.defect_location}</strong></div>}
+        {info.defect_severity && <div className="info-item"><span>严重程度</span><strong>{info.defect_severity}</strong></div>}
+        {info.batch_number && <div className="info-item"><span>批次号</span><strong>{info.batch_number}</strong></div>}
+        {info.inspection_result && <div className="info-item"><span>检测结论</span><strong className={info.inspection_result.includes("不合格") ? "defect" : ""}>{info.inspection_result}</strong></div>}
+        {info.summary && <div className="info-item full"><span>摘要</span><strong>{info.summary}</strong></div>}
+      </div>
+      {Object.keys(params).length > 0 && <div className="param-grid">
+        <div className="ocr-section-title" style={{marginTop:8}}>工艺参数</div>
+        {Object.entries(params).map(([k, v]) => <div className="info-item" key={k}><span>{k}</span><strong>{String(v)}</strong></div>)}
+      </div>}
+    </div>}
+
+    {docText && <div className="ocr-actions">
+      <button onClick={runCrossModal}>跨模态关联分析</button>
+    </div>}
+
+    {crossAnalysis && <div className="ocr-result-section">
+      <div className="ocr-section-title">跨模态关联分析结果</div>
+      <pre className="ocr-text cross-modal">{crossAnalysis}</pre>
+    </div>}
+  </section>;
 }
 
 function AgentPanel({ dataset, eventId }: any) {

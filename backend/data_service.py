@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -423,11 +427,45 @@ def report(dataset: str, event_id: int | None = None) -> dict[str, Any]:
     }
 
 
-def agent_answer(dataset: str, question: str, event_id: int | None = None) -> dict[str, Any]:
+def agent_answer(
+    dataset: str,
+    question: str,
+    event_id: int | None = None,
+    ocr_text: str | None = None,
+) -> dict[str, Any]:
     calls = ["detect_event", "rank_root_cause", "inspect_edge_degradation", "generate_report"]
     rep = report(dataset, event_id)
     rc = root_cause(dataset, event_id)
     graph = relation_graph(dataset, event_id)
+    ov = overview(dataset)
+
+    context: dict[str, Any] = {
+        "overview": ov,
+        "root_cause": rc,
+        "relation_graph": graph,
+        "report": rep,
+    }
+    if ocr_text:
+        context["ocr_text"] = ocr_text
+        calls.append("ocr_extract")
+
+    try:
+        from ernie_service import get_ernie
+
+        ernie = get_ernie()
+        result = ernie.chat(question, context)
+        if result["success"]:
+            calls.append("erniebot_reasoning")
+            return {
+                "answer": result["answer"],
+                "model": result["model"],
+                "tool_calls": [{"name": name, "status": "ok"} for name in calls],
+                "report": rep,
+            }
+        logger.warning("ErnieBot 调用失败，回退到模板回答: %s", result.get("error"))
+    except Exception as exc:
+        logger.warning("ErnieBot 不可用，回退到模板回答: %s", exc)
+
     top = rc["candidates"][0] if rc["candidates"] else {"name": "unknown"}
     edge = graph["top_edges"][0] if graph["top_edges"] else {"source": top["name"], "target": "adjacent", "degradation": 0}
     answer = (
@@ -439,11 +477,277 @@ def agent_answer(dataset: str, question: str, event_id: int | None = None) -> di
         answer = "已生成诊断报告：" + "；".join(section["body"] for section in rep["sections"])
     elif "步骤" in question or "排查" in question:
         answer = f"排查步骤：1. 核对 {top['name']} 原始读数；2. 检查 {edge['source']} 与 {edge['target']} 的联动关系；3. 复核泵/阀门状态；4. 将事件窗口导出给运维人员确认。"
+
     return {
         "answer": answer,
+        "model": "template",
         "tool_calls": [{"name": name, "status": "ok"} for name in calls],
         "report": rep,
     }
+
+
+def extract_docx_text(file_base64: str) -> dict[str, Any]:
+    """从 base64 编码的 DOCX 文档提取文字（python-docx，纯 Python）。"""
+    import base64
+    import tempfile
+
+    try:
+        _, data = ("", file_base64)
+        if "," in file_base64:
+            _, data = file_base64.split(",", 1)
+        file_bytes = base64.b64decode(data)
+    except Exception as exc:
+        return {"success": False, "text": "", "error": f"Base64 解码失败: {exc}"}
+
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+        tmp.write(file_bytes)
+        tmp.close()
+
+        from docx import Document
+
+        doc = Document(tmp.name)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        # 也提取表格内容
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    paragraphs.append(" | ".join(cells))
+        text = "\n".join(paragraphs)
+        return {"success": True, "text": text, "paragraphs_count": len(paragraphs), "error": None}
+    except ImportError:
+        return {"success": False, "text": "", "error": "python-docx 未安装，请执行: pip install python-docx"}
+    except Exception as exc:
+        logger.exception("DOCX 提取失败")
+        return {"success": False, "text": "", "error": str(exc)}
+    finally:
+        if tmp:
+            Path(tmp.name).unlink(missing_ok=True)
+
+
+def extract_pdf_text(file_base64: str) -> dict[str, Any]:
+    """从 base64 编码的 PDF 文档提取文字（PyPDF2）。"""
+    import base64
+    import tempfile
+
+    try:
+        _, data = ("", file_base64)
+        if "," in file_base64:
+            _, data = file_base64.split(",", 1)
+        file_bytes = base64.b64decode(data)
+    except Exception as exc:
+        return {"success": False, "text": "", "error": f"Base64 解码失败: {exc}"}
+
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp.write(file_bytes)
+        tmp.close()
+
+        from PyPDF2 import PdfReader
+
+        reader = PdfReader(tmp.name)
+        paragraphs = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                for line in text.split("\n"):
+                    stripped = line.strip()
+                    if stripped:
+                        paragraphs.append(stripped)
+        text = "\n".join(paragraphs)
+        return {"success": True, "text": text, "paragraphs_count": len(paragraphs), "error": None}
+    except ImportError:
+        return {"success": False, "text": "", "error": "PyPDF2 未安装，请执行: pip install PyPDF2"}
+    except Exception as exc:
+        logger.exception("PDF 提取失败")
+        return {"success": False, "text": "", "error": str(exc)}
+    finally:
+        if tmp:
+            Path(tmp.name).unlink(missing_ok=True)
+
+
+def ocr_extract_image(image_base64: str) -> dict[str, Any]:
+    """对 base64 编码的工厂文档图片执行 OCR 文字提取（DB + SVTR_LCNet）。"""
+    import base64
+
+    try:
+        _, data = ("", image_base64)
+        if "," in image_base64:
+            _, data = image_base64.split(",", 1)
+        image_bytes = base64.b64decode(data)
+    except Exception as exc:
+        return {"success": False, "text": "", "items": [], "error": f"Base64 解码失败: {exc}"}
+
+    try:
+        from ocr_service import extract_text_from_bytes
+        return extract_text_from_bytes(image_bytes)
+    except ImportError:
+        return {"success": False, "text": "", "items": [], "error": "PaddleOCR 未安装"}
+    except Exception as exc:
+        logger.exception("OCR 提取异常")
+        return {"success": False, "text": "", "items": [], "error": str(exc)}
+
+
+def extract_industrial_info(doc_text: str) -> dict[str, Any]:
+    """通过 ErnieBot 从文档文本中抽取工业生产关键信息。"""
+    try:
+        from ernie_service import get_ernie
+
+        return get_ernie().extract_industrial_info(doc_text)
+    except ImportError:
+        return {"success": False, "info": {}, "error": "ErnieBot 未安装"}
+    except Exception as exc:
+        logger.exception("工业信息抽取失败")
+        return {"success": False, "info": {}, "error": str(exc)}
+
+
+def cross_modal_analyze(
+    dataset: str,
+    doc_text: str,
+    doc_info: dict[str, Any],
+    event_id: int | None = None,
+) -> dict[str, Any]:
+    """跨模态关联分析：将质检文档信息与传感器异常数据关联。"""
+    rc = root_cause(dataset, event_id)
+    graph = relation_graph(dataset, event_id)
+    ov = overview(dataset)
+    rep = report(dataset, event_id)
+
+    diagnosis_context: dict[str, Any] = {
+        "overview": ov,
+        "root_cause": rc,
+        "relation_graph": graph,
+        "report": rep,
+    }
+
+    try:
+        from ernie_service import get_ernie
+
+        return get_ernie().cross_modal_analyze(doc_text, doc_info, diagnosis_context)
+    except ImportError:
+        return {"success": False, "analysis": "", "error": "ErnieBot 未安装"}
+    except Exception as exc:
+        logger.exception("跨模态分析失败")
+        return {"success": False, "analysis": "", "error": str(exc)}
+
+
+# ---------- 诊断任务（/api/diagnosis/tasks） ----------
+
+@dataclass
+class DiagnosisTask:
+    task_id: str
+    dataset: str
+    event_id: int | None
+    question: str
+    status: str = "created"
+    stage: str = "created"
+    thinking_chunks: list[str] = field(default_factory=list)
+    report_chunks: list[str] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    created_at: float = field(default_factory=time.time)
+
+DIAGNOSIS_TASKS: dict[str, DiagnosisTask] = {}
+DIAGNOSIS_LOCK = threading.Lock()
+
+
+def create_diagnosis_task(dataset: str, event_id: int | None, question: str) -> DiagnosisTask:
+    task_id = uuid.uuid4().hex
+    task = DiagnosisTask(task_id=task_id, dataset=dataset, event_id=event_id, question=question)
+    with DIAGNOSIS_LOCK:
+        DIAGNOSIS_TASKS[task_id] = task
+    thread = threading.Thread(target=_run_diagnosis, args=(task_id,), daemon=True)
+    thread.start()
+    return task
+
+
+def get_diagnosis_task(task_id: str) -> dict[str, Any]:
+    with DIAGNOSIS_LOCK:
+        task = DIAGNOSIS_TASKS.get(task_id)
+    if not task:
+        raise KeyError(task_id)
+    return {
+        "task_id": task.task_id,
+        "dataset": task.dataset,
+        "event_id": task.event_id,
+        "question": task.question,
+        "status": task.status,
+        "stage": task.stage,
+        "thinking_chunks": task.thinking_chunks,
+        "report_chunks": task.report_chunks,
+        "tool_calls": task.tool_calls,
+        "result": task.result,
+        "error": task.error,
+    }
+
+
+def get_diagnosis_chunks(task_id: str) -> dict[str, list[str]]:
+    with DIAGNOSIS_LOCK:
+        task = DIAGNOSIS_TASKS.get(task_id)
+    if not task:
+        raise KeyError(task_id)
+    return {
+        "thinking_chunks": task.thinking_chunks,
+        "report_chunks": task.report_chunks,
+    }
+
+
+def _run_diagnosis(task_id: str) -> None:
+    with DIAGNOSIS_LOCK:
+        task = DIAGNOSIS_TASKS.get(task_id)
+    if not task:
+        return
+
+    stage_messages = [
+        ("detecting", "检测报警事件并读取 Relation-EVGAT 联合异常分数。"),
+        ("evidence_collecting", "汇总节点预测误差、根因候选和关系退化边。"),
+        ("retrieving_knowledge", "检索知识库中的变量说明、SOP 和方法资料。"),
+        ("reasoning", "按 ReAct 风格串联工具结果，正在调用 ErnieBot 大模型推理。"),
+        ("reporting", "生成结构化诊断报告和排查建议。"),
+    ]
+    try:
+        for stage, message in stage_messages:
+            task.status = "running"
+            task.stage = stage
+            task.thinking_chunks.append(message)
+            time.sleep(0.08)
+
+        result = agent_answer(task.dataset, task.question, task.event_id)
+        task.result = result
+        task.tool_calls = result.get("tool_calls", [])
+        task.report_chunks = [result["answer"]]
+        task.thinking_chunks.append("[completed] 诊断完成")
+        task.stage = "completed"
+        task.status = "completed"
+    except Exception as exc:
+        task.status = "failed"
+        task.stage = "failed"
+        task.error = str(exc)
+        task.thinking_chunks.append(f"[error] {exc}")
+
+
+# ---------- 知识库（/api/knowledge/*） ----------
+
+def knowledge_documents() -> dict[str, Any]:
+    from knowledge_service import list_documents
+
+    return list_documents()
+
+
+def knowledge_upload(filename: str, content: str) -> dict[str, Any]:
+    from knowledge_service import upload_document
+
+    return upload_document(filename, content)
+
+
+def knowledge_search(query: str, top_k: int = 5) -> dict[str, Any]:
+    from knowledge_service import search_knowledge
+
+    return search_knowledge(query, top_k)
 
 
 def health() -> dict[str, Any]:
@@ -537,89 +841,4 @@ def get_job(job_id: str) -> dict[str, Any]:
         "output_dir": job.output_dir,
         "error": job.error,
         "log_tail": log_tail,
-    }
-
-# Phase 2 clean text overrides. Keep the original data loading helpers intact while
-# replacing the user-facing Chinese text that was corrupted in the v1 prototype.
-def root_cause(dataset: str, event_id: int | None = None) -> dict[str, Any]:
-    bundle = load_result_bundle(dataset)
-    columns = bundle["columns"]
-    event = selected_event(dataset, event_id)
-    names = parse_names(event.get("top10_joint"))
-    indices = parse_indices(event.get("top10_joint_indices"))
-    joint_scores = [_safe_float(x) for x in str(event.get("top10_joint_scores", "")).split(";") if x.strip()]
-    node_scores = [_safe_float(x) for x in str(event.get("top10_node_scores", "")).split(";") if x.strip()]
-    edge_scores = [_safe_float(x) for x in str(event.get("top10_edge_scores", "")).split(";") if x.strip()]
-    if not names:
-        node_errors = bundle["node_errors"]
-        mean_errors = node_errors.mean(axis=0)
-        indices = np.argsort(mean_errors)[::-1][:10].astype(int).tolist()
-        names = [columns[i] for i in indices]
-        joint_scores = [_safe_float(mean_errors[i]) for i in indices]
-        node_scores = joint_scores
-        edge_scores = [0.0] * len(indices)
-    max_score = max(joint_scores or [1.0])
-    candidates = []
-    for rank, name in enumerate(names[:10], start=1):
-        raw_score = joint_scores[rank - 1] if rank - 1 < len(joint_scores) else max_score / rank
-        candidates.append(
-            {
-                "rank": rank,
-                "name": name,
-                "index": indices[rank - 1] if rank - 1 < len(indices) else None,
-                "score": _safe_float(raw_score),
-                "normalized": _safe_float(raw_score / (max_score + 1e-9)),
-                "node_score": _safe_float(node_scores[rank - 1] if rank - 1 < len(node_scores) else 0.0),
-                "edge_score": _safe_float(edge_scores[rank - 1] if rank - 1 < len(edge_scores) else 0.0),
-            }
-        )
-    top = candidates[0] if candidates else {"name": "unknown", "score": 0.0}
-    return {
-        "dataset": dataset,
-        "event": event,
-        "candidates": candidates,
-        "evidence": [
-            {"label": "节点预测误差", "value": f"{top['name']} 的重构/预测误差排名最高", "severity": "high"},
-            {"label": "关系退化证据", "value": f"{top['name']} 的相邻关系边出现退化信号", "severity": "high"},
-            {"label": "异常窗口", "value": f"事件 #{event.get('event_id', 1)}", "severity": "medium"},
-            {"label": "建议优先级", "value": f"优先检查 {top['name']} 及其上下游变量", "severity": "medium"},
-        ],
-    }
-
-
-def report(dataset: str, event_id: int | None = None) -> dict[str, Any]:
-    ov = overview(dataset)
-    rc = root_cause(dataset, event_id)
-    graph = relation_graph(dataset, event_id)
-    event = rc["event"]
-    top = rc["candidates"][0] if rc["candidates"] else {"name": "unknown"}
-    edge = graph["top_edges"][0] if graph["top_edges"] else {"source": top["name"], "target": "adjacent", "degradation": 0.0}
-    window = f"{event.get('raw_start_time', event.get('start', '-'))}~{event.get('raw_end_time', event.get('end', '-'))}"
-    return {
-        "event_id": event.get("event_id", 1),
-        "dataset": dataset,
-        "time_window": window,
-        "title": f"{dataset} 异常事件 #{event.get('event_id', 1)} 诊断报告",
-        "sections": [
-            {"title": "异常概况", "body": f"系统在 {window} 窗口内检测到持续异常，峰值异常分数为 {ov['current_score']:.2f}，阈值为 {ov['threshold']:.2f}。"},
-            {"title": "根因候选", "body": f"{top['name']} 排名第一，候选排序由节点预测误差和相邻关系退化证据共同决定。"},
-            {"title": "关系退化", "body": f"Top 退化边为 {edge['source']} -> {edge['target']}，退化强度约 {edge['degradation']:.2f}。该证据用于排查线索，不直接声明严格因果链。"},
-            {"title": "运维建议", "body": f"优先检查 {top['name']} 的读数、执行状态、相邻阀泵和控制链路，并复核该异常窗口的上下游联动关系。"},
-        ],
-    }
-
-
-def agent_answer(dataset: str, question: str, event_id: int | None = None) -> dict[str, Any]:
-    from backend.agent import RuleDiagnosisAgent
-
-    return RuleDiagnosisAgent().execute(dataset, event_id, question)
-
-
-def health() -> dict[str, Any]:
-    datasets = available_datasets()
-    return {
-        "ok": bool(datasets) and RELATION_SCRIPT.exists(),
-        "project_root": str(PROJECT_ROOT),
-        "relation_script": RELATION_SCRIPT.exists(),
-        "datasets": datasets,
     }

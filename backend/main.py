@@ -1,19 +1,31 @@
 ﻿from __future__ import annotations
 
+import os
 from typing import Literal
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 
-from fastapi import FastAPI, HTTPException, Query, Request
+DEPS = Path(__file__).resolve().parent / ".deps"
+if DEPS.exists():
+    sys.path.insert(0, str(DEPS))
+
+# ErnieBot 认证配置：优先读环境变量，否则使用默认值
+os.environ.setdefault("ERNIE_API_KEY", "dPiR9tEhhwi9ioLWmFrj1ZFB")
+os.environ.setdefault("ERNIE_SECRET_KEY", "nLYGWiCG7nwt76rq2Jplz7wigQYscYGO")
+
+import json
+import time
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import data_service as svc
-from . import diagnosis_tasks
-from .model import ModelFactory
-from .rag import get_knowledge_store
+import data_service as svc
 
 
-app = FastAPI(title="Relation-EVGAT Industrial Diagnosis Agent", version="0.2.0")
+app = FastAPI(title="Relation-EVGAT Industrial Diagnosis Agent", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,31 +49,27 @@ class AgentRequest(BaseModel):
     dataset: str = "WaDI_A2_ds10"
     question: str
     event_id: int | None = None
+    image_base64: str | None = None
 
 
-class DiagnosisRequest(BaseModel):
+class DocxRequest(BaseModel):
+    file_base64: str
+
+
+class OCRRequest(BaseModel):
+    image_base64: str
+
+
+class CrossModalRequest(BaseModel):
     dataset: str = "WaDI_A2_ds10"
-    event_id: int | None = 1
-    question: str = "为什么报警？请给出根因和排查建议。"
-    use_llm: bool = False
-
-
-class KnowledgeUploadRequest(BaseModel):
-    filename: str = "note.txt"
-    content: str
-
-
-class KnowledgeSearchRequest(BaseModel):
-    query: str
-    top_k: int | None = None
+    doc_text: str
+    doc_info: dict | None = None
+    event_id: int | None = None
 
 
 @app.get("/api/health")
 def health():
-    payload = svc.health()
-    payload["knowledge"] = get_knowledge_store().status
-    payload["agent"] = ModelFactory().status().__dict__
-    return payload
+    return svc.health()
 
 
 @app.get("/api/datasets")
@@ -121,7 +129,85 @@ def root_cause(dataset: str = "WaDI_A2_ds10", event_id: int | None = Query(defau
 @app.post("/api/agent/ask")
 def agent(req: AgentRequest):
     try:
-        return svc.agent_answer(req.dataset, req.question, req.event_id)
+        ocr_text: str | None = None
+        if req.image_base64:
+            ocr_result = svc.ocr_extract_image(req.image_base64)
+            if ocr_result["success"]:
+                ocr_text = ocr_result["text"]
+        return svc.agent_answer(req.dataset, req.question, req.event_id, ocr_text=ocr_text)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/ocr/extract")
+def ocr_extract(req: OCRRequest):
+    """工厂文档图片 OCR 文字提取（DB + SVTR_LCNet）。"""
+    result = svc.ocr_extract_image(req.image_base64)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "OCR failed"))
+    return result
+
+
+@app.post("/api/ocr/extract-info")
+def ocr_extract_info(req: OCRRequest):
+    """工厂文档图片 → OCR 提取文字 → ErnieBot 抽取关键信息。"""
+    ocr_result = svc.ocr_extract_image(req.image_base64)
+    if not ocr_result["success"]:
+        raise HTTPException(status_code=400, detail=ocr_result.get("error", "OCR failed"))
+    info_result = svc.extract_industrial_info(ocr_result["text"])
+    return {
+        "ocr_text": ocr_result["text"],
+        "ocr_items_count": len(ocr_result.get("items", [])),
+        "industrial_info": info_result.get("info", {}),
+        "info_raw": info_result.get("raw", ""),
+    }
+
+
+@app.post("/api/document/extract")
+def document_extract(req: DocxRequest):
+    """DOCX 文档文字提取（python-docx）。"""
+    result = svc.extract_docx_text(req.file_base64)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "extraction failed"))
+    return result
+
+
+@app.post("/api/document/extract-info")
+def document_extract_info(req: DocxRequest):
+    """
+    文档文字提取（支持 DOCX / PDF）→ ErnieBot 抽取工业关键信息。
+    """
+    b64 = req.file_base64
+    is_pdf = "application/pdf" in b64.split(",", 1)[0] if "," in b64 else b64.startswith("JVBER")
+    if is_pdf:
+        doc_result = svc.extract_pdf_text(b64)
+    else:
+        doc_result = svc.extract_docx_text(b64)
+    if not doc_result["success"]:
+        raise HTTPException(status_code=400, detail=doc_result.get("error", "extraction failed"))
+
+    info_result = svc.extract_industrial_info(doc_result["text"])
+    return {
+        "doc_text": doc_result["text"],
+        "paragraphs_count": doc_result.get("paragraphs_count", 0),
+        "industrial_info": info_result.get("info", {}),
+        "info_raw": info_result.get("raw", ""),
+    }
+
+
+@app.post("/api/agent/cross-modal")
+def cross_modal(req: CrossModalRequest):
+    """
+    跨模态关联分析：
+    将质检文档信息与传感器异常检测数据关联，辅助缺陷溯源。
+    """
+    try:
+        doc_info = req.doc_info or {}
+        result = svc.cross_modal_analyze(req.dataset, req.doc_text, doc_info, req.event_id)
+        if not result["success"]:
+            status_code = 429 if "配额" in (result.get("error") or "") else 500
+            raise HTTPException(status_code=status_code, detail=result.get("error", "analysis failed"))
+        return result
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -134,82 +220,99 @@ def report(dataset: str = "WaDI_A2_ds10", event_id: int | None = Query(default=N
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+# ---------- 诊断任务 ----------
+
+class DiagnosisRequest(BaseModel):
+    dataset: str = "WaDI_A2_ds10"
+    event_id: int | None = None
+    question: str = "为什么报警？"
+    use_llm: bool = True
+
+
 @app.post("/api/diagnosis/tasks")
-def create_diagnosis_task(req: DiagnosisRequest):
+def create_diagnosis(req: DiagnosisRequest):
     try:
-        return diagnosis_tasks.create_task(req.dataset, req.event_id, req.question, req.use_llm)
+        task = svc.create_diagnosis_task(req.dataset, req.event_id, req.question)
+        return {
+            "task_id": task.task_id,
+            "status": task.status,
+            "stage": task.stage,
+            "dataset": task.dataset,
+        }
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/diagnosis/tasks/{task_id}")
-def get_diagnosis_task(task_id: str):
+def get_diagnosis(task_id: str):
     try:
-        return diagnosis_tasks.task_summary(task_id)
+        return svc.get_diagnosis_task(task_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}") from exc
 
 
-@app.get("/api/diagnosis/tasks/{task_id}/tool-calls")
-def get_diagnosis_tool_calls(task_id: str):
-    try:
-        return diagnosis_tasks.task_tool_calls(task_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+def _sse_stream(chunks: list[str], event_type: str):
+    """将字符串列表转为 SSE 事件流。"""
+    def generate():
+        for text in chunks:
+            yield f"event: {event_type}\ndata: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
+    return generate()
 
 
 @app.get("/api/diagnosis/tasks/{task_id}/thinking/stream")
-def stream_diagnosis_thinking(task_id: str):
+def diagnosis_thinking_stream(task_id: str):
     try:
-        diagnosis_tasks.get_task(task_id)
+        data = svc.get_diagnosis_chunks(task_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}") from exc
     return StreamingResponse(
-        diagnosis_tasks.format_sse(diagnosis_tasks.stream_events(task_id, "thinking")),
+        _sse_stream(data["thinking_chunks"], "thinking"),
         media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 @app.get("/api/diagnosis/tasks/{task_id}/report/stream")
-def stream_diagnosis_report(task_id: str):
+def diagnosis_report_stream(task_id: str):
     try:
-        diagnosis_tasks.get_task(task_id)
+        data = svc.get_diagnosis_chunks(task_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"Diagnosis task not found: {task_id}") from exc
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}") from exc
     return StreamingResponse(
-        diagnosis_tasks.format_sse(diagnosis_tasks.stream_events(task_id, "report")),
+        _sse_stream(data["report_chunks"], "report"),
         media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------- 知识库 ----------
+
+class KnowledgeUploadRequest(BaseModel):
+    filename: str
+    content: str
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
 
 
 @app.get("/api/knowledge/documents")
 def knowledge_documents():
-    store = get_knowledge_store()
-    return {"documents": store.list_documents(), "status": store.status}
+    return svc.knowledge_documents()
 
 
 @app.post("/api/knowledge/upload")
-async def knowledge_upload(request: Request):
-    store = get_knowledge_store()
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        payload = await request.json()
-        body = KnowledgeUploadRequest(**payload)
-        return store.ingest_text(body.filename, body.content)
-    raw = await request.body()
-    filename = request.headers.get("x-filename", "upload.txt")
-    return store.ingest_text(filename, raw.decode("utf-8", errors="ignore"))
+def knowledge_upload(req: KnowledgeUploadRequest):
+    return svc.knowledge_upload(req.filename, req.content)
 
 
 @app.post("/api/knowledge/search")
 def knowledge_search(req: KnowledgeSearchRequest):
-    store = get_knowledge_store()
-    return {"query": req.query, "hits": store.search(req.query, req.top_k), "status": store.status}
+    return svc.knowledge_search(req.query, req.top_k)
 
 
-@app.delete("/api/knowledge/documents/{doc_id}")
-def delete_knowledge_document(doc_id: str):
-    deleted = get_knowledge_store().delete_document(doc_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
-    return {"deleted": True, "doc_id": doc_id}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
