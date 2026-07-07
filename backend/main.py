@@ -5,6 +5,7 @@ from typing import Literal
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 DEPS = Path(__file__).resolve().parent / ".deps"
 if os.environ.get("FAGENT_USE_LOCAL_DEPS") == "1" and DEPS.exists():
@@ -28,6 +29,7 @@ load_env_file()
 
 import data_service as svc
 import finetune_service as ftsvc
+import diagnosis_tasks
 
 
 app = FastAPI(title="Relation-EVGAT Industrial Diagnosis Agent", version="0.1.0")
@@ -59,6 +61,7 @@ class AgentRequest(BaseModel):
 
 class DocxRequest(BaseModel):
     file_base64: str
+    filename: str = ""
 
 
 class OCRRequest(BaseModel):
@@ -181,6 +184,7 @@ def document_extract(req: DocxRequest):
 def document_extract_info(req: DocxRequest):
     """
     文档文字提取（支持 DOCX / PDF）→ ErnieBot 抽取工业关键信息。
+    同时自动保存到历史上传记录。
     """
     b64 = req.file_base64
     is_pdf = "application/pdf" in b64.split(",", 1)[0] if "," in b64 else b64.startswith("JVBER")
@@ -192,12 +196,55 @@ def document_extract_info(req: DocxRequest):
         raise HTTPException(status_code=400, detail=doc_result.get("error", "extraction failed"))
 
     info_result = svc.extract_industrial_info(doc_result["text"])
+    doc_id = svc.save_document_to_history(
+        req.filename or "document",
+        doc_result["text"],
+        info_result.get("info", {}),
+    )
     return {
+        "doc_id": doc_id,
         "doc_text": doc_result["text"],
         "paragraphs_count": doc_result.get("paragraphs_count", 0),
         "industrial_info": info_result.get("info", {}),
         "info_raw": info_result.get("raw", ""),
     }
+
+
+@app.get("/api/document/history")
+def document_history():
+    """返回历史上传文档列表。"""
+    return {"documents": svc.document_history()}
+
+
+@app.get("/api/document/history/{doc_id}")
+def document_history_item(doc_id: str):
+    """获取某个历史文档的完整内容。"""
+    record = svc.get_document_from_history(doc_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    return record
+
+
+@app.delete("/api/document/history/{doc_id}")
+def document_history_delete(doc_id: str):
+    """删除某个历史文档。"""
+    deleted = svc.delete_document_from_history(doc_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    return {"deleted": True, "doc_id": doc_id}
+
+
+class UpdateAnalysisRequest(BaseModel):
+    analysis: str
+
+
+@app.put("/api/document/history/{doc_id}/analysis")
+def document_history_update_analysis(doc_id: str, req: UpdateAnalysisRequest):
+    """将跨模态分析结果保存到文档历史记录。"""
+    updated = svc.update_document_analysis(doc_id, req.analysis)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    return {"updated": True, "doc_id": doc_id}
 
 
 @app.post("/api/agent/cross-modal")
@@ -237,13 +284,7 @@ class DiagnosisRequest(BaseModel):
 @app.post("/api/diagnosis/tasks")
 def create_diagnosis(req: DiagnosisRequest):
     try:
-        task = svc.create_diagnosis_task(req.dataset, req.event_id, req.question)
-        return {
-            "task_id": task.task_id,
-            "status": task.status,
-            "stage": task.stage,
-            "dataset": task.dataset,
-        }
+        return diagnosis_tasks.create_task(req.dataset, req.event_id, req.question, req.use_llm)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -251,27 +292,19 @@ def create_diagnosis(req: DiagnosisRequest):
 @app.get("/api/diagnosis/tasks/{task_id}")
 def get_diagnosis(task_id: str):
     try:
-        return svc.get_diagnosis_task(task_id)
+        return diagnosis_tasks.task_summary(task_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}") from exc
-
-
-def _sse_stream(chunks: list[str], event_type: str):
-    """将字符串列表转为 SSE 事件流。"""
-    def generate():
-        for text in chunks:
-            yield f"event: {event_type}\ndata: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
-    return generate()
 
 
 @app.get("/api/diagnosis/tasks/{task_id}/thinking/stream")
 def diagnosis_thinking_stream(task_id: str):
     try:
-        data = svc.get_diagnosis_chunks(task_id)
+        events = diagnosis_tasks.stream_events(task_id, "thinking")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}") from exc
     return StreamingResponse(
-        _sse_stream(data["thinking_chunks"], "thinking"),
+        diagnosis_tasks.format_sse(events),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -280,14 +313,20 @@ def diagnosis_thinking_stream(task_id: str):
 @app.get("/api/diagnosis/tasks/{task_id}/report/stream")
 def diagnosis_report_stream(task_id: str):
     try:
-        data = svc.get_diagnosis_chunks(task_id)
+        events = diagnosis_tasks.stream_events(task_id, "report")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}") from exc
     return StreamingResponse(
-        _sse_stream(data["report_chunks"], "report"),
+        diagnosis_tasks.format_sse(events),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/diagnosis/history")
+def diagnosis_history():
+    """返回诊断任务历史记录列表。"""
+    return {"tasks": diagnosis_tasks.list_history()}
 
 
 # ---------- 知识库 ----------

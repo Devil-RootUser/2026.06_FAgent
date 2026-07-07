@@ -5,18 +5,19 @@ ErnieBot（百度文心大模型）工业诊断对话模块。
 - 实现语义理解、智能问答、跨模态关联
 - 将 OCR 提取的文档信息与传感器异常数据关联，辅助缺陷溯源与成因分析
 """
-
 from __future__ import annotations
-
+import threading
+import time
 import json
 import logging
 import os
 from typing import Any
 
 try:
-    from erniebot.errors import RequestLimitError
+    from erniebot.errors import RequestLimitError, RateLimitError
 except ImportError:
     RequestLimitError = Exception
+    RateLimitError = Exception
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,8 @@ class ErnieService:
         api_key: str | None = None,
         secret_key: str | None = None,
         access_token: str | None = None,
+        #model: str = "ernie-4.5-VL-8k-preview"
+        #model: str = "ernie-speed-8k"
         model: str = "ernie-3.5",
     ):
         try:
@@ -161,18 +164,26 @@ class ErnieService:
             )
 
         self._model = model
+        # QPS限流控制
+        self._last_call_time = 0.0
+        self._qps_lock = threading.Lock()
+        self._min_interval = 1.0  # 保守1秒1次，彻底防超限
 
     def chat(
-        self,
-        question: str,
-        context: dict[str, Any] | None = None,
-        temperature: float = 0.3,
-    ) -> dict[str, Any]:
+            self,
+            question: str,
+            context: dict[str, Any] | None = None,
+            temperature: float = 0.3,
+        ) -> dict[str, Any]:
+        # QPS限流等待
+        with self._qps_lock:
+            now = time.time()
+            wait_sec = self._last_call_time + self._min_interval - now
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            self._last_call_time = time.time()
         """
         智能问答：结合诊断上下文生成自然语言回答。
-
-        Returns:
-            {"success": bool, "answer": str, "model": str, "error": str|None}
         """
         import erniebot
 
@@ -192,25 +203,28 @@ class ErnieService:
                 "model": self._model,
                 "error": None,
             }
-        except RequestLimitError:
-            logger.warning("ErnieBot API 日配额已用完")
+        except (RequestLimitError, RateLimitError):
+            logger.warning("ErnieBot QPS超限/配额用尽")
             return {"success": False, "answer": "", "model": self._model,
-                    "error": "API 日调用配额已用完，请明天再试或更换 API Key"}
+                    "error": "接口调用频次已达上限，请稍后再试或更换密钥"}
         except Exception as exc:
             logger.exception("ErnieBot 调用失败")
             return {"success": False, "answer": "", "model": self._model, "error": str(exc)}
 
     def extract_industrial_info(self, ocr_text: str) -> dict[str, Any]:
         """
-        从 文档 文本中抽取工业生产关键信息。
-        提取：工艺参数、缺陷类型/位置/严重程度、材料、批次号、检测结论。
-
-        Returns:
-            {"success": bool, "info": dict, "error": str|None}
+        从文档文本中抽取工业生产关键信息。
         """
+        with self._qps_lock:
+            now = time.time()
+            wait_sec = self._last_call_time + self._min_interval - now
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            self._last_call_time = time.time()
+
         import erniebot
 
-        user_prompt = f"以下是工业文档的 文档 识别结果，请提取关键信息：\n\n{ocr_text}"
+        user_prompt = f"以下是工业文档识别结果，请提取关键信息：\n\n{ocr_text}"
 
         try:
             response = erniebot.ChatCompletion.create(
@@ -221,12 +235,11 @@ class ErnieService:
                 top_p=0.5,
             )
             raw = response.get_result()
-            # 尝试解析 JSON
             info = self._parse_json_response(raw)
             return {"success": True, "info": info, "raw": raw, "error": None}
-        except RequestLimitError:
-            logger.warning("ErnieBot API 日配额已用完（信息抽取）")
-            return {"success": False, "info": {}, "error": "API 日调用配额已用完，请明天再试或更换 API Key"}
+        except (RequestLimitError, RateLimitError):
+            logger.warning("信息抽取触发QPS限制")
+            return {"success": False, "info": {}, "error": "接口调用频次已达上限，请稍后再试"}
         except Exception as exc:
             logger.exception("信息抽取失败")
             return {"success": False, "info": {}, "error": str(exc)}
@@ -238,17 +251,20 @@ class ErnieService:
         diagnosis_context: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        跨模态关联分析：将质检文档（文档）与传感器异常数据关联。
-        辅助缺陷溯源和成因分析。
-
-        Returns:
-            {"success": bool, "analysis": str, "error": str|None}
+        跨模态关联分析：将质检文档与传感器异常数据关联。
         """
+        with self._qps_lock:
+            now = time.time()
+            wait_sec = self._last_call_time + self._min_interval - now
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            self._last_call_time = time.time()
+
         import erniebot
 
         diagnosis_text = _build_context_prompt("跨模态关联分析", diagnosis_context)
         user_prompt = (
-            f"【质检文档文档内容】\n{ocr_text}\n\n"
+            f"【质检文档内容】\n{ocr_text}\n\n"
             f"【抽取的关键信息】\n{json.dumps(ocr_info, ensure_ascii=False, indent=2)}\n\n"
             f"【传感器异常检测数据】\n{diagnosis_text}"
         )
@@ -267,15 +283,21 @@ class ErnieService:
                 "model": self._model,
                 "error": None,
             }
-        except RequestLimitError:
-            logger.warning("ErnieBot API 日配额已用完（跨模态分析）")
-            return {"success": False, "analysis": "", "error": "API 日调用配额已用完，请明天再试或更换 API Key"}
+        except (RequestLimitError, RateLimitError):
+            logger.warning("跨模态分析触发QPS限制")
+            return {"success": False, "analysis": "", "error": "接口调用频次已达上限，请稍后再试"}
         except Exception as exc:
             logger.exception("跨模态分析失败")
             return {"success": False, "analysis": "", "error": str(exc)}
 
     def generate_report(self, dataset: str, context: dict[str, Any]) -> dict[str, Any]:
         """生成诊断报告。"""
+        with self._qps_lock:
+            now = time.time()
+            wait_sec = self._last_call_time + self._min_interval - now
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            self._last_call_time = time.time()
         prompt = (
             f"请为数据集 {dataset} 的异常事件生成一份简洁的诊断报告，"
             f"包含：异常概况、根因分析、关系退化、运维建议四个部分。"
@@ -286,7 +308,6 @@ class ErnieService:
     def _parse_json_response(raw: str) -> dict[str, Any]:
         """从 LLM 回复中解析 JSON。"""
         raw = raw.strip()
-        # 去掉可能的 markdown 代码块标记
         if raw.startswith("```"):
             lines = raw.split("\n")
             raw = "\n".join(lines[1:]) if len(lines) > 1 else raw
@@ -295,9 +316,7 @@ class ErnieService:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            # 尝试用正则提取
             import re
-
             result: dict[str, Any] = {}
             patterns = {
                 "defect_type": r"缺陷类型[：:]\s*(\S+)",
@@ -312,7 +331,6 @@ class ErnieService:
                 m = re.search(pat, raw)
                 if m:
                     result[key] = m.group(1).strip()
-            # 提取工艺参数
             param_pattern = re.compile(r"(\S+)[=＝](\S+)")
             params: dict[str, str] = {}
             for m in param_pattern.finditer(raw):

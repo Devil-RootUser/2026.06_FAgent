@@ -29,22 +29,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.9
-          run_install: false
-
+      # 删掉了原来的 pnpm/action-setup 配置
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
+          # 改成 npm 缓存
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: pnpm install --frozen-lockfile
+        # 改成 npm ci（推荐，用本地的 package-lock.json 精准安装）
+        run: npm ci
 
       - name: Build frontend
         working-directory: frontend
-        run: pnpm run build
-
+        run: npm run build
