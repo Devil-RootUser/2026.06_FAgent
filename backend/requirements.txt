@@ -2,6 +2,9 @@
 uvicorn[standard]>=0.30
 numpy>=1.24
 pydantic>=2.7
+erniebot>=0.5
+python-docx>=1.0
+PyPDF2>=2.0
 
 # Optional phase-2 Agent/RAG enhancements. The app runs without these by using
 # the deterministic rule agent and keyword RAG fallback.

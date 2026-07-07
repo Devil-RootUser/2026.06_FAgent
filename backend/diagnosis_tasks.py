@@ -86,19 +86,30 @@ def _run_task(task_id: str) -> None:
     with LOCK:
         task = TASKS[task_id]
     try:
-        _set_stage(task, "detecting", "检测报警事件并读取 Relation-EVGAT 联合异常分数。")
-        time.sleep(0.08)
-        _set_stage(task, "evidence_collecting", "汇总节点预测误差、根因候选和关系退化边。")
-        time.sleep(0.08)
-        _set_stage(task, "retrieving_knowledge", "检索知识库中的变量说明、SOP 和方法资料。")
-        time.sleep(0.08)
-        _set_stage(task, "reasoning", "按 ReAct 风格串联工具结果，形成诊断结论。")
+        task.stage = "detecting"
+        task.status = "running"
+        task.updated_at = time.time()
+        _save(task)
 
         def emit(kind: str, text: str, payload: dict[str, Any] | None = None) -> None:
             if kind == "tool" and payload:
                 task.tool_calls.append(payload)
+                # 根据工具名称推进阶段
+                tool = payload.get("name", "")
+                if tool == "get_event_summary":
+                    task.stage = "detecting"
+                elif tool in ("rank_root_causes", "inspect_edge_degradation", "inspect_sensor_window"):
+                    task.stage = "evidence_collecting"
+                elif tool == "retrieve_maintenance_knowledge":
+                    task.stage = "retrieving_knowledge"
+                elif tool == "generate_report":
+                    task.stage = "reporting"
+                elif tool in ("dashscope_chat", "erniebot_reasoning"):
+                    task.stage = "reasoning"
+                task.thinking_chunks.append(text)
             elif kind == "report":
                 task.report_chunks.append(text)
+                task.stage = "completed"
             else:
                 task.thinking_chunks.append(text)
             task.updated_at = time.time()
@@ -108,10 +119,6 @@ def _run_task(task_id: str) -> None:
         result = RuleDiagnosisAgent().execute(task.dataset, task.event_id, task.question, emit=emit, use_llm=task.use_llm)
         task.result = result
         task.tool_calls = result.get("tool_calls", task.tool_calls)
-        _set_stage(task, "reporting", "生成结构化诊断报告和排查建议。")
-        task.report_chunks.append(result["answer"])
-        _publish(task.task_id, "report", result["answer"], {"status": "completed"})
-        task.stage = "completed"
         task.status = "completed"
         task.updated_at = time.time()
         _save(task)
@@ -190,3 +197,30 @@ def format_sse(events):
         yield f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+def list_history(limit: int = 30) -> list[dict[str, Any]]:
+    """列出已完成的诊断任务历史（按时间倒序）。"""
+    items = []
+    for path in sorted(TASK_ROOT.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            answer = ""
+            if data.get("result") and data["result"].get("answer"):
+                answer = data["result"]["answer"]
+            elif data.get("report_chunks"):
+                answer = "".join(data["report_chunks"])
+            items.append({
+                "task_id": data["task_id"],
+                "dataset": data.get("dataset", ""),
+                "event_id": data.get("event_id"),
+                "question": data.get("question", ""),
+                "status": data.get("status", ""),
+                "stage": data.get("stage", ""),
+                "answer": answer[:800],
+                "created_at": data.get("created_at", 0),
+                "use_llm": data.get("use_llm", False),
+            })
+        except (json.JSONDecodeError, OSError, KeyError):
+            continue
+        if len(items) >= limit:
+            break
+    return items

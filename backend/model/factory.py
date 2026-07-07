@@ -1,4 +1,7 @@
 ﻿from __future__ import annotations
+import threading
+import time
+
 
 import json
 import urllib.error
@@ -23,6 +26,10 @@ class ModelFactory:
 
     def __init__(self) -> None:
         self.config = load_agent_config()
+        """QPS限制控制变量"""
+        self._last_call_time = 0.0
+        self._qps_lock = threading.Lock()
+        self._min_interval = 1.0 / 5
 
     def status(self) -> ModelStatus:
         configured = bool(self.config.get("llm_api_key"))
@@ -37,6 +44,13 @@ class ModelFactory:
         )
 
     def chat(self, messages: list[dict[str, str]], temperature: float = 0.2, timeout: int = 45) -> str:
+        #新增QPS限流闸门
+        with self._qps_lock:
+            now = time.time()
+            wait_time = self._last_call_time + self._min_interval - now
+            if wait_time > 0:
+                time.sleep(wait_time)
+            self._last_call_time = time.time()
         status = self.status()
         if not status.configured:
             raise RuntimeError("LLM_API_KEY is empty")

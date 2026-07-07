@@ -2,6 +2,7 @@
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
+
 const API = (import.meta as any).env?.VITE_API_BASE || "http://127.0.0.1:8000";
 const STATUS_LABELS: Record<string, string> = {
   queued: "排队中",
@@ -109,6 +110,7 @@ function App() {
       {route === "/diagnosis" && <Diagnosis dataset={dataset} eventId={eventId} />}
       {route === "/knowledge" && <Knowledge />}
       {route === "/report" && <报告 dataset={dataset} eventId={eventId} />}
+      {route === "/history" && <DiagnosisHistory />}
     </main>
   </div>;
 }
@@ -126,7 +128,7 @@ function TopBar({ dataset, job }: any) {
 }
 
 function Sidebar({ route, nav }: any) {
-  const items = [["/dashboard", "实时监控"], ["/relations", "关系退化"], ["/root-cause", "根因分析"], ["/diagnosis", "诊断 Agent"], ["/knowledge", "知识库"], ["/report", "诊断报告"]];
+  const items = [["/dashboard", "实时监控"], ["/relations", "关系退化"], ["/root-cause", "根因分析"], ["/diagnosis", "诊断 Agent"], ["/knowledge", "知识库"], ["/report", "诊断报告"], ["/history", "查询记录"]];
   return <aside className="sidebar">
     {items.map(([p, label]) => <button key={p} className={route === p ? "active" : ""} onClick={() => nav(p)}>{label}</button>)}
     <div className="model-card"><span>系统架构</span><strong>Agent + RAG</strong><small>ChromaDB 配置</small><small>关键词兜底检索</small></div>
@@ -255,17 +257,159 @@ function 报告({ dataset, eventId }: any) {
   const ask = async (q: string) => { const r = await postJson("/api/agent/ask", { dataset, event_id: eventId, question: q }); setAnswer(r.answer); setCalls(r.tool_calls); };
   if (rep.error) return <State text={rep.error} />;
   if (!rep.data) return <State text="正在加载报告..." />;
-  return <div className="report-layout"><section className="panel chat-main"><PanelTitle title="诊断问答" note="快捷问题" /><div className="quick">{["为什么报警？", "最可疑变量", "生成报告", "排查步骤"].map((q) => <button key={q} onClick={() => ask(q)}>{q}</button>)}</div><div className="bubble user">这个事件为什么报警？</div><div className="bubble agent"><strong>Agent 诊断</strong><p>{answer || rep.data.sections.map((s: any) => s.body).join(" ")}</p></div><div className="tool-log">{(calls.length ? calls : ["get_event_summary", "rank_root_causes", "inspect_edge_degradation", "generate_report"].map((name) => ({ name, status: "ready" }))).map((c: any) => <span key={c.name}>{toolLabel(c.name)}：{statusLabel(c.status)}</span>)}</div></section><section className="panel report-main"><PanelTitle title="自动生成诊断报告" note={`事件 ID: ${rep.data.event_id}   时间窗口：${rep.data.time_window}`} />{rep.data.sections.map((s: any) => <article className="report-card" key={s.title}><h3>{s.title}</h3><p>{s.body}</p></article>)}<div className="report-actions"><button>导出 PDF</button><button>工具调用日志</button></div></section></div>;
+  const handleExportPdf = () => { window.print(); };
+  return <div className="report-layout"><section className="panel chat-main"><PanelTitle title="诊断问答" note="快捷问题" /><div className="quick">{["为什么报警？", "最可疑变量", "生成报告", "排查步骤"].map((q) => <button key={q} onClick={() => ask(q)}>{q}</button>)}</div><div className="bubble user">这个事件为什么报警？</div><div className="bubble agent"><strong>Agent 诊断</strong><p>{answer || rep.data.sections.map((s: any) => s.body).join(" ")}</p></div><div className="tool-log">{(calls.length ? calls : ["get_event_summary", "rank_root_causes", "inspect_edge_degradation", "generate_report"].map((name) => ({ name, status: "ready" }))).map((c: any) => <span key={c.name}>{toolLabel(c.name)}：{statusLabel(c.status)}</span>)}</div></section><section className="panel report-main" id="printable-report"><PanelTitle title="自动生成诊断报告" note={`事件 ID: ${rep.data.event_id}   时间窗口：${rep.data.time_window}`} />{rep.data.sections.map((s: any) => <article className="report-card" key={s.title}><h3>{s.title}</h3><p>{s.body}</p></article>)}<div className="report-actions no-print"><button onClick={handleExportPdf}>导出 PDF</button><button>工具调用日志</button></div></section></div>;
+}
+
+function DiagnosisHistory() {
+  const [tab, setTab] = useState<"diagnosis" | "document">("diagnosis");
+  const [tasks, setTasks] = useState<any[]>([]);
+  const [docs, setDocs] = useState<any[]>([]);
+  const [selected, setSelected] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+
+  const fetchTasks = () => {
+    getJson("/api/diagnosis/history").then((d) => setTasks(d.tasks || [])).catch(() => {});
+  };
+  const fetchDocs = () => {
+    getJson("/api/document/history").then((d) => setDocs(d.documents || [])).catch(() => {});
+  };
+
+  useEffect(() => { fetchTasks(); fetchDocs(); }, []);
+
+  const loadTask = async (taskId: string) => {
+    setLoading(true);
+    try { const t = await getJson(`/api/diagnosis/tasks/${taskId}`); setSelected(t); }
+    catch { setSelected(null); }
+    finally { setLoading(false); }
+  };
+
+  const loadDoc = async (docId: string) => {
+    setLoading(true);
+    try { const r = await getJson(`/api/document/history/${docId}`); setSelected(r); }
+    catch { setSelected(null); }
+    finally { setLoading(false); }
+  };
+
+  const deleteDoc = async (docId: string) => {
+    await fetch(`${API}/api/document/history/${docId}`, { method: "DELETE" });
+    if (selected?.doc_id === docId) setSelected(null);
+    fetchDocs();
+  };
+
+  const formatDate = (ts: number) => {
+    const d = new Date(ts * 1000);
+    return `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, "0")}-${d.getDate().toString().padStart(2, "0")} ${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+  };
+
+  const stLabels: Record<string, string> = { completed: "已完成", failed: "失败", running: "运行中" };
+
+  const isDocTab = tab === "document";
+  const list = isDocTab ? docs : tasks;
+  const listTitle = isDocTab ? "文档智检记录" : "诊断查询记录";
+  const listNote = `共 ${list.length} 条`;
+  const emptyText = isDocTab ? "暂无记录，请先在「诊断 Agent」页面上传文档。" : "暂无诊断记录，请先在「诊断 Agent」中执行任务。";
+
+  const info = !isDocTab ? null : (selected?.industrial_info || {});
+  const params = (info && info.process_params) || {};
+
+  return <div className="history-layout" id="printable-history">
+    <section className="panel history-list-panel no-print-tabs">
+      <div className="history-tabs">
+        <button className={!isDocTab ? "active" : ""} onClick={() => { setTab("diagnosis"); setSelected(null); }}>诊断记录</button>
+        <button className={isDocTab ? "active" : ""} onClick={() => { setTab("document"); setSelected(null); }}>文档记录</button>
+      </div>
+      <PanelTitle title={listTitle} note={listNote} />
+      <div className="history-query-list">
+        {list.length === 0 && <StateCompact text={emptyText} />}
+        {isDocTab
+          ? docs.map((d: any) => (
+            <div key={d.doc_id} className={`history-query-row ${selected?.doc_id === d.doc_id ? "active" : ""}`} onClick={() => loadDoc(d.doc_id)}>
+              <div className="hq-top">
+                <span className="hq-question">{d.filename}</span>
+                <button className="history-del" onClick={(e) => { e.stopPropagation(); deleteDoc(d.doc_id); }} title="删除">×</button>
+              </div>
+              <div className="hq-meta">{formatDate(d.created_at)} · {d.text_length} 字符{d.has_info ? " · 已抽取" : ""}</div>
+              {d.text_preview && <div className="hq-preview">{d.text_preview}...</div>}
+            </div>
+          ))
+          : tasks.map((t: any) => (
+            <div key={t.task_id} className={`history-query-row ${selected?.task_id === t.task_id ? "active" : ""}`} onClick={() => loadTask(t.task_id)}>
+              <div className="hq-top">
+                <span className="hq-question">{t.question}</span>
+                <span className={`hq-status ${t.status}`}>{stLabels[t.status] || t.status}</span>
+              </div>
+              <div className="hq-meta">{formatDate(t.created_at)} · {t.dataset} · 事件 #{t.event_id || "-"}{t.use_llm ? " · LLM" : ""}</div>
+            </div>
+          ))}
+      </div>
+    </section>
+
+    <section className="panel history-detail-panel" id="printable-detail">
+      <PanelTitle title={isDocTab ? "文档详情" : "问答详情"} note={selected ? (isDocTab ? selected.filename : `任务 ${selected.task_id?.slice(0, 10)}...`) : "点击左侧记录查看"} />
+      {loading && <State text="加载中..." />}
+      {!loading && selected && !isDocTab && (
+        <div className="history-detail">
+          <div className="detail-block"><div className="detail-label">诊断问题</div><div className="detail-value question">{selected.question}</div></div>
+          <div className="detail-block"><div className="detail-label">数据集 / 事件</div><div className="detail-value">{selected.dataset} · 事件 #{selected.event_id || "-"} · {selected.use_llm ? "LLM 推理" : "规则引擎"}</div></div>
+          <div className="detail-block"><div className="detail-label">诊断回答</div><div className="detail-value answer">{selected.result?.answer || selected.report_chunks?.join("") || "无回答内容"}</div></div>
+          {selected.tool_calls?.length > 0 && (
+            <div className="detail-block"><div className="detail-label">工具调用</div>
+              <div className="detail-calls">{selected.tool_calls.map((c: any) => <span key={c.name} className={c.status}>{toolLabel(c.name)} · {statusLabel(c.status)}</span>)}</div>
+            </div>
+          )}
+        </div>
+      )}
+      {!loading && selected && isDocTab && (
+        <div className="history-detail">
+          <div className="detail-block"><div className="detail-label">文件名</div><div className="detail-value question">{selected.filename}</div></div>
+          <div className="detail-block"><div className="detail-label">上传时间</div><div className="detail-value">{formatDate(selected.created_at)}</div></div>
+          {info && (Object.keys(params).length > 0 || info.defect_type || info.material) && (
+            <div className="detail-block"><div className="detail-label">关键工业信息</div>
+              <div className="info-grid" style={{marginTop: 4}}>
+                {info.material && <div className="info-item"><span>材料/部件</span><strong>{info.material}</strong></div>}
+                {info.defect_type && <div className="info-item"><span>缺陷类型</span><strong className="defect">{info.defect_type}</strong></div>}
+                {info.defect_location && <div className="info-item"><span>缺陷位置</span><strong>{info.defect_location}</strong></div>}
+                {info.defect_severity && <div className="info-item"><span>严重程度</span><strong>{info.defect_severity}</strong></div>}
+                {info.batch_number && <div className="info-item"><span>批次号</span><strong>{info.batch_number}</strong></div>}
+                {info.inspection_result && <div className="info-item"><span>检测结论</span><strong className={info.inspection_result?.includes("不合格") ? "defect" : ""}>{info.inspection_result}</strong></div>}
+                {info.summary && <div className="info-item full"><span>摘要</span><strong>{info.summary}</strong></div>}
+              </div>
+              {Object.keys(params).length > 0 && <div className="param-grid" style={{marginTop: 8}}>{Object.entries(params).map(([k, v]: [string, any]) => <div className="info-item" key={k}><span>{k}</span><strong>{String(v)}</strong></div>)}</div>}
+            </div>
+          )}
+          <div className="detail-block"><div className="detail-label">文档全文</div><div className="detail-value answer">{selected.doc_text?.substring(0, 2000) || "无内容"}{selected.doc_text?.length > 2000 ? "..." : ""}</div></div>
+          {selected.cross_modal_analysis && (
+            <div className="detail-block"><div className="detail-label">跨模态分析结果</div><div className="detail-value answer">{selected.cross_modal_analysis}</div></div>
+          )}
+          <div className="no-print"><button className="detail-delete-btn" onClick={() => deleteDoc(selected.doc_id)}>删除此记录</button></div>
+        </div>
+      )}
+      {!loading && !selected && <StateCompact text={isDocTab ? "选择一条记录查看文档详情。" : "选择一条记录查看当时的诊断问题和回答。"} />}
+      <div className="no-print" style={{marginTop: 16}}><button onClick={() => window.print()} className="print-btn">打印</button></div>
+    </section>
+  </div>;
 }
 
 function OCRDocPanel({ dataset, eventId }: any) {
   const [docText, setDocText] = useState("");
+  const [docId, setDocId] = useState("");
   const [paragraphsCount, setParagraphsCount] = useState(0);
   const [industrialInfo, setIndustrialInfo] = useState<any>(null);
   const [crossAnalysis, setCrossAnalysis] = useState("");
   const [uploading, setUploading] = useState(false);
   const [fileName, setFileName] = useState("");
   const [statusMsg, setStatusMsg] = useState("上传工业文档（Word / PDF，质检报告、工艺卡等），自动提取文字并抽取工艺参数、缺陷描述");
+  const [history, setHistory] = useState<any[]>([]);
+
+  const fetchHistory = async () => {
+    try {
+      const res = await getJson("/api/document/history");
+      setHistory(res.documents || []);
+    } catch { /* 忽略 */ }
+  };
+
+  useEffect(() => { fetchHistory(); }, []);
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -281,21 +425,50 @@ function OCRDocPanel({ dataset, eventId }: any) {
     reader.onload = async () => {
       const base64 = (reader.result as string);
       try {
-        const res = await postJson("/api/document/extract-info", { file_base64: base64 });
+        const res = await postJson("/api/document/extract-info", { file_base64: base64, filename: file.name });
+        setDocId(res.doc_id || "");
         setDocText(res.doc_text || "");
         setParagraphsCount(res.paragraphs_count || 0);
         setIndustrialInfo(res.industrial_info || {});
-        setCrossAnalysis("");
+        setCrossAnalysis(res.cross_modal_analysis || "");
         setStatusMsg(`提取完成：${res.doc_text?.length || 0} 字符，已抽取关键信息`);
+        fetchHistory();
       } catch (err) {
         setStatusMsg("提取失败：" + String(err));
         setDocText("");
+        setDocId("");
         setIndustrialInfo(null);
       } finally {
         setUploading(false);
       }
     };
     reader.readAsDataURL(file);
+  };
+
+  const loadFromHistory = async (docId: string, fname: string) => {
+    setUploading(true);
+    setStatusMsg("加载历史文档...");
+    try {
+      const res = await getJson(`/api/document/history/${docId}`);
+      setDocId(res.doc_id || "");
+      setDocText(res.doc_text || "");
+      setParagraphsCount(res.doc_text?.length || 0);
+      setIndustrialInfo(res.industrial_info || {});
+      setCrossAnalysis(res.cross_modal_analysis || "");
+      setFileName(fname);
+      setStatusMsg(`已加载：${fname}`);
+    } catch (err) {
+      setStatusMsg("加载失败：" + String(err));
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const deleteFromHistory = async (docId: string) => {
+    try {
+      await fetch(`${API}/api/document/history/${docId}`, { method: "DELETE" });
+      fetchHistory();
+    } catch { /* 忽略 */ }
   };
 
   const runCrossModal = async () => {
@@ -308,8 +481,19 @@ function OCRDocPanel({ dataset, eventId }: any) {
         doc_text: docText,
         doc_info: industrialInfo || {},
       });
-      setCrossAnalysis(res.analysis || "");
+      const analysis = res.analysis || "";
+      setCrossAnalysis(analysis);
       setStatusMsg("跨模态关联分析完成");
+      if (docId && analysis) {
+        try {
+          await fetch(`${API}/api/document/history/${docId}/analysis`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ analysis }),
+          });
+          fetchHistory();
+        } catch { /* 静默保存 */ }
+      }
     } catch (err) {
       setStatusMsg("跨模态分析失败：" + String(err));
     }
@@ -318,8 +502,13 @@ function OCRDocPanel({ dataset, eventId }: any) {
   const info = industrialInfo || {};
   const params = info.process_params || {};
 
+  const formatTime = (ts: number) => {
+    const d = new Date(ts * 1000);
+    return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+  };
+
   return <section className="panel ocr-panel">
-    <PanelTitle title="工厂文档智检" note="上传质检报告/工艺卡（Word / PDF） → 文字提取 → ErnieBot 抽取工艺参数、缺陷描述 → 跨模态关联传感器异常（图片 OCR 暂不支持）" />
+    <PanelTitle title="工厂文档智检" note="上传质检报告/工艺卡（Word / PDF） → 文字提取 → ErnieBot 抽取工艺参数、缺陷描述 → 跨模态关联传感器异常" />
     <div className="ocr-upload-row">
       <label className="upload-btn">{uploading ? "处理中..." : "选择文档"}
         <input type="file" accept=".docx,.doc,.pdf" onChange={handleFile} disabled={uploading} style={{display:"none"}} />
@@ -327,6 +516,21 @@ function OCRDocPanel({ dataset, eventId }: any) {
       <span className="ocr-status">{statusMsg}</span>
       {fileName && <span className="file-name-tag">{fileName}</span>}
     </div>
+
+    {history.length > 0 && <div className="ocr-history">
+      <div className="ocr-section-title">历史上传</div>
+      <div className="history-list">
+        {history.slice(0, 8).map((h: any) => (
+          <div className="history-row" key={h.doc_id}>
+            <span className="history-name" onClick={() => loadFromHistory(h.doc_id, h.filename)} title={h.text_preview}>
+              {h.filename}
+            </span>
+            <span className="history-meta">{formatTime(h.created_at)} · {h.text_length} 字符{h.has_info ? " · 已抽取" : ""}</span>
+            <button className="history-del" onClick={() => deleteFromHistory(h.doc_id)} title="删除">×</button>
+          </div>
+        ))}
+      </div>
+    </div>}
 
     {docText && <div className="ocr-result-section">
       <div className="ocr-section-title">提取的文字内容</div>

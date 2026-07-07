@@ -634,102 +634,6 @@ def cross_modal_analyze(
         return {"success": False, "analysis": "", "error": str(exc)}
 
 
-# ---------- 诊断任务（/api/diagnosis/tasks） ----------
-
-@dataclass
-class DiagnosisTask:
-    task_id: str
-    dataset: str
-    event_id: int | None
-    question: str
-    status: str = "created"
-    stage: str = "created"
-    thinking_chunks: list[str] = field(default_factory=list)
-    report_chunks: list[str] = field(default_factory=list)
-    tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    result: dict[str, Any] | None = None
-    error: str | None = None
-    created_at: float = field(default_factory=time.time)
-
-DIAGNOSIS_TASKS: dict[str, DiagnosisTask] = {}
-DIAGNOSIS_LOCK = threading.Lock()
-
-
-def create_diagnosis_task(dataset: str, event_id: int | None, question: str) -> DiagnosisTask:
-    task_id = uuid.uuid4().hex
-    task = DiagnosisTask(task_id=task_id, dataset=dataset, event_id=event_id, question=question)
-    with DIAGNOSIS_LOCK:
-        DIAGNOSIS_TASKS[task_id] = task
-    thread = threading.Thread(target=_run_diagnosis, args=(task_id,), daemon=True)
-    thread.start()
-    return task
-
-
-def get_diagnosis_task(task_id: str) -> dict[str, Any]:
-    with DIAGNOSIS_LOCK:
-        task = DIAGNOSIS_TASKS.get(task_id)
-    if not task:
-        raise KeyError(task_id)
-    return {
-        "task_id": task.task_id,
-        "dataset": task.dataset,
-        "event_id": task.event_id,
-        "question": task.question,
-        "status": task.status,
-        "stage": task.stage,
-        "thinking_chunks": task.thinking_chunks,
-        "report_chunks": task.report_chunks,
-        "tool_calls": task.tool_calls,
-        "result": task.result,
-        "error": task.error,
-    }
-
-
-def get_diagnosis_chunks(task_id: str) -> dict[str, list[str]]:
-    with DIAGNOSIS_LOCK:
-        task = DIAGNOSIS_TASKS.get(task_id)
-    if not task:
-        raise KeyError(task_id)
-    return {
-        "thinking_chunks": task.thinking_chunks,
-        "report_chunks": task.report_chunks,
-    }
-
-
-def _run_diagnosis(task_id: str) -> None:
-    with DIAGNOSIS_LOCK:
-        task = DIAGNOSIS_TASKS.get(task_id)
-    if not task:
-        return
-
-    stage_messages = [
-        ("detecting", "检测报警事件并读取 Relation-EVGAT 联合异常分数。"),
-        ("evidence_collecting", "汇总节点预测误差、根因候选和关系退化边。"),
-        ("retrieving_knowledge", "检索知识库中的变量说明、SOP 和方法资料。"),
-        ("reasoning", "按 ReAct 风格串联工具结果，正在调用 ErnieBot 大模型推理。"),
-        ("reporting", "生成结构化诊断报告和排查建议。"),
-    ]
-    try:
-        for stage, message in stage_messages:
-            task.status = "running"
-            task.stage = stage
-            task.thinking_chunks.append(message)
-            time.sleep(0.08)
-
-        result = agent_answer(task.dataset, task.question, task.event_id)
-        task.result = result
-        task.tool_calls = result.get("tool_calls", [])
-        task.report_chunks = [result["answer"]]
-        task.thinking_chunks.append("[completed] 诊断完成")
-        task.stage = "completed"
-        task.status = "completed"
-    except Exception as exc:
-        task.status = "failed"
-        task.stage = "failed"
-        task.error = str(exc)
-        task.thinking_chunks.append(f"[error] {exc}")
-
-
 # ---------- 知识库（/api/knowledge/*） ----------
 
 def knowledge_documents() -> dict[str, Any]:
@@ -748,6 +652,98 @@ def knowledge_search(query: str, top_k: int = 5) -> dict[str, Any]:
     from knowledge_service import search_knowledge
 
     return search_knowledge(query, top_k)
+
+
+# ---------- 文档历史上传（/api/document/history/*） ----------
+
+DOC_HISTORY_FILE = OUTPUT_ROOT / "document_history.json"
+DOC_HISTORY_LOCK = threading.Lock()
+
+
+def _load_doc_history() -> list[dict[str, Any]]:
+    if DOC_HISTORY_FILE.exists():
+        try:
+            return json.loads(DOC_HISTORY_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def _save_doc_history(records: list[dict[str, Any]]) -> None:
+    DOC_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DOC_HISTORY_FILE.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def document_history() -> list[dict[str, Any]]:
+    """返回历史上传文档列表（不含全文，仅摘要信息）。"""
+    with DOC_HISTORY_LOCK:
+        records = _load_doc_history()
+    result = []
+    for r in records:
+        preview = r.get("doc_text", "")[:120]
+        result.append({
+            "doc_id": r["doc_id"],
+            "filename": r["filename"],
+            "created_at": r["created_at"],
+            "text_preview": preview,
+            "text_length": len(r.get("doc_text", "")),
+            "has_info": bool(r.get("industrial_info")),
+        })
+    return result
+
+
+def save_document_to_history(filename: str, doc_text: str, industrial_info: dict[str, Any] | None = None) -> str:
+    """保存文档到历史记录，返回 doc_id。"""
+    doc_id = uuid.uuid4().hex[:12]
+    record = {
+        "doc_id": doc_id,
+        "filename": filename,
+        "created_at": time.time(),
+        "doc_text": doc_text,
+        "industrial_info": industrial_info or {},
+    }
+    with DOC_HISTORY_LOCK:
+        records = _load_doc_history()
+        records.insert(0, record)
+        if len(records) > 50:
+            records = records[:50]
+        _save_doc_history(records)
+    return doc_id
+
+
+def get_document_from_history(doc_id: str) -> dict[str, Any] | None:
+    """按 doc_id 获取历史文档全文。"""
+    with DOC_HISTORY_LOCK:
+        records = _load_doc_history()
+    for r in records:
+        if r["doc_id"] == doc_id:
+            return r
+    return None
+
+
+def delete_document_from_history(doc_id: str) -> bool:
+    """删除历史文档。"""
+    with DOC_HISTORY_LOCK:
+        records = _load_doc_history()
+    new_records = [r for r in records if r["doc_id"] != doc_id]
+    if len(new_records) == len(records):
+        return False
+    with DOC_HISTORY_LOCK:
+        _save_doc_history(new_records)
+    return True
+
+
+def update_document_analysis(doc_id: str, analysis: str) -> bool:
+    """将跨模态分析结果写入文档历史记录。"""
+    with DOC_HISTORY_LOCK:
+        records = _load_doc_history()
+    for r in records:
+        if r["doc_id"] == doc_id:
+            r["cross_modal_analysis"] = analysis
+            with DOC_HISTORY_LOCK:
+                _save_doc_history(records)
+            return True
+    return False
 
 
 def health() -> dict[str, Any]:
