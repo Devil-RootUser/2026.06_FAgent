@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -36,6 +36,8 @@ const TOOL_LABELS: Record<string, string> = {
   detect_event: "异常检测",
   rank_root_cause: "根因排序",
   erniebot_reasoning: "大模型推理",
+  dashscope_chat: "DeepSeek V4 Pro",
+  inspect_qwen_evidence: "LoRA/Qwen 证据",
 };
 
 function statusLabel(value?: string) {
@@ -123,7 +125,7 @@ function TopBar({ dataset, job }: any) {
     <div className="top-spacer" />
     <span className="pill">{dataset}</span>
     <span className="pill alert">可解释边向量</span>
-    <span className="agent-online">规则 Agent 就绪</span>
+    <span className="agent-online">DeepSeek 诊断入口</span>
     {job && <span className={`job ${job.status}`}>训练 {statusLabel(job.status)}</span>}
   </header>;
 }
@@ -218,16 +220,17 @@ function Diagnosis({ dataset, eventId }: any) {
   const stages = ["created", "detecting", "evidence_collecting", "retrieving_knowledge", "reasoning", "reporting", "completed"];
   const activeIndex = Math.max(0, stages.indexOf(task?.stage || "created"));
   const calls = task?.tool_calls || task?.result?.tool_calls || [];
+  const result = task?.result;
 
   return <div className="diagnosis-layout">
-    <section className="panel diagnosis-command"><PanelTitle title="诊断任务" note="先调用 Relation-EVGAT 工具链，再由 DashScope 大模型生成诊断" />
+    <section className="panel diagnosis-command"><PanelTitle title="诊断任务" note="先汇总 Relation-EVGAT、LoRA/Qwen 与知识库证据，再由 DeepSeek V4 Pro 生成诊断" />
       <label className="field-label">诊断问题</label><textarea value={question} onChange={(e) => set诊断问题(e.target.value)} />
       <div className="diagnosis-actions"><button onClick={start} disabled={busy || task?.status === "running"}>开始诊断</button><span>{task ? `任务 ${task.task_id.slice(0, 8)} · ${statusLabel(task.status)}` : "暂无任务"}</span></div>
       <div className="stage-track">{stages.map((stage, idx) => <div key={stage} className={idx <= activeIndex ? "done" : ""}><i />{stageLabel(stage)}</div>)}</div>
     </section>
     <section className="panel thinking-panel"><PanelTitle title="Agent 思考流" note="阶段事件与工具执行更新" /><LogList rows={thinking} empty="等待任务流输出..." /></section>
     <section className="panel tool-panel"><PanelTitle title="工具调用日志" note="工业诊断工具" />{calls.length ? calls.map((c: any) => <div className="tool-row" key={c.name}><strong>{toolLabel(c.name)}</strong><span>{statusLabel(c.status)}</span><small>{c.duration_ms || 0} ms</small></div>) : <StateCompact text="任务启动后会显示工具调用。" />}</section>
-      <section className="panel final-panel"><PanelTitle title="报告生成流" note="包含根因与排查建议的最终回答" /><LogList rows={reportStream} empty="报告流尚未生成。" /></section>
+      <section className="panel final-panel"><PanelTitle title="报告生成流" note="包含根因与排查建议的最终回答" />{result && <div className={`model-state ${result.fallback_used ? "fallback" : "ok"}`}><strong>{result.used_llm ? `${result.model_name} · 调用成功` : "规则回答 · 已回退"}</strong>{result.request_id && <small>请求 {result.request_id}</small>}{result.llm_error && <small>{result.llm_error}</small>}</div>}<LogList rows={reportStream} empty="报告流尚未生成。" /></section>
       <OCRDocPanel dataset={dataset} eventId={eventId} />
   </div>;
 }
@@ -799,8 +802,23 @@ function OCRDocPanel({ dataset, eventId }: any) {
 
 function AgentPanel({ dataset, eventId }: any) {
   const [answer, setAnswer] = useState("我可以为当前事件调用异常摘要、根因排序、关系退化、知识库检索和报告生成工具。");
-  const ask = async (q: string) => { const r = await postJson("/api/agent/ask", { dataset, event_id: eventId, question: q }); setAnswer(r.answer); };
-  return <aside className="agent-panel"><h2>诊断 Agent</h2><p>异常摘要 / 根因排序 / 关系退化 / RAG / 报告</p><div className="bubble user">用户：为什么报警？</div><div className="bubble agent">{answer}</div><div className="agent-actions"><button onClick={() => ask("生成报告")}>报告</button><button onClick={() => ask("排查步骤")}>排查步骤</button></div></aside>;
+  const [meta, setMeta] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const ask = async (q: string) => {
+    setBusy(true); setError("");
+    try {
+      const r = await postJson("/api/agent/ask", { dataset, event_id: eventId, question: q });
+      setAnswer(r.answer);
+      setMeta(r);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const stateLabel = meta?.used_llm ? `${meta.model_name} · 调用成功` : meta?.fallback_used ? "规则回答 · DeepSeek 回退" : "等待调用 DeepSeek V4 Pro";
+  return <aside className="agent-panel"><h2>DeepSeek 诊断 Agent</h2><p>异常摘要 / 根因排序 / 关系退化 / RAG / 报告</p><div className={`model-state ${meta?.fallback_used ? "fallback" : meta?.used_llm ? "ok" : ""}`}><strong>{stateLabel}</strong>{meta?.request_id && <small>请求 {meta.request_id}</small>}{meta?.llm_error && <small>{meta.llm_error}</small>}{error && <small>{error}</small>}</div><div className="bubble user">用户：为什么报警？</div><div className="bubble agent">{busy ? "正在汇总证据并调用 DeepSeek..." : answer}</div><div className="agent-actions"><button disabled={busy} onClick={() => ask("生成报告")}>报告</button><button disabled={busy} onClick={() => ask("排查步骤")}>排查步骤</button></div></aside>;
 }
 
 function Metric({ title, value, note, accent }: any) { return <div className={`metric ${accent ? "accent" : ""}`}><span>{title}</span><strong>{value}</strong><small>{note}</small></div>; }
