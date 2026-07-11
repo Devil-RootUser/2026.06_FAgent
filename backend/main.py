@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from typing import Literal
@@ -142,7 +142,11 @@ def agent(req: AgentRequest):
             ocr_result = svc.ocr_extract_image(req.image_base64)
             if ocr_result["success"]:
                 ocr_text = ocr_result["text"]
-        return svc.agent_answer(req.dataset, req.question, req.event_id, ocr_text=ocr_text)
+        question = req.question
+        if ocr_text:
+            question += f"\n\nOCR 补充文本：{ocr_text[:3000]}"
+        from agent import RuleDiagnosisAgent
+        return RuleDiagnosisAgent().execute(req.dataset, req.event_id, question, use_llm=True)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

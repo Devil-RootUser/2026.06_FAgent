@@ -1418,3 +1418,19 @@ input {
   .panel-title p { font-size: 11px; }
 }
 
+
+.model-state {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid #cbd8df;
+  border-radius: 8px;
+  background: #f5f8fa;
+  color: #405462;
+  font-size: 12px;
+}
+.model-state.ok { border-color: #7eaa91; background: #eef7f1; color: #28603f; }
+.model-state.fallback { border-color: #d5ad65; background: #fff8e8; color: #79551d; }
+.model-state small { overflow-wrap: anywhere; }
